@@ -1,6 +1,10 @@
 package com.webcamo.ui
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Rect
@@ -8,6 +12,7 @@ import android.graphics.YuvImage
 import android.hardware.camera2.*
 import android.media.ImageReader
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -20,6 +25,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.webcamo.databinding.ActivityAutoConnectBinding
+import com.webcamo.service.CameraStreamService
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
 import java.io.OutputStream
@@ -124,8 +130,21 @@ class AutoConnectActivity : AppCompatActivity() {
             == PackageManager.PERMISSION_GRANTED) {
             startCameraPreview()
             startDiscovery()
+            // Start foreground service for background streaming
+            startStreamingService()
         } else {
             permissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+    
+    private fun startStreamingService() {
+        val serviceIntent = Intent(this, CameraStreamService::class.java).apply {
+            action = CameraStreamService.ACTION_START
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
         }
     }
     
