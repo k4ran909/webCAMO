@@ -11,6 +11,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
     <!-- Camera feature -->
     <uses-feature android:name="android.hardware.camera" android:required="true" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
@@ -25,9 +27,9 @@
         android:theme="@style/Theme.WebCAMO"
         tools:targetApi="34">
 
-        <!-- Simple TCP Streaming Activity (Default/Recommended) -->
+        <!-- Auto-Connect Activity (Default - Iriun-like experience) -->
         <activity
-            android:name=".ui.SimpleStreamActivity"
+            android:name=".ui.AutoConnectActivity"
             android:exported="true"
             android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize">
@@ -36,6 +38,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Simple TCP Streaming Activity (Manual IP entry) -->
+        <activity
+            android:name=".ui.SimpleStreamActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize"/>
 
         <!-- WebRTC Activity (Advanced) -->
         <activity
