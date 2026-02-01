@@ -30,14 +30,15 @@ import java.nio.ByteOrder
 /**
  * Auto-discovery streaming activity - Iriun-like experience
  * No IP entry required - discovers PC automatically via UDP broadcast
+ * OPTIMIZED: Fast discovery (500ms), immediate connection
  */
 class AutoConnectActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "AutoConnect"
         private const val DISCOVERY_PORT = 9001
         private const val STREAM_PORT = 9000
-        private const val DISCOVERY_INTERVAL = 2000L
-        private const val JPEG_QUALITY = 80
+        private const val DISCOVERY_INTERVAL = 500L  // Fast: 500ms between scans
+        private const val JPEG_QUALITY = 85
         private const val VIDEO_WIDTH = 1280
         private const val VIDEO_HEIGHT = 720
     }
@@ -148,7 +149,7 @@ class AutoConnectActivity : AppCompatActivity() {
         withContext(Dispatchers.IO) {
             try {
                 val socket = DatagramSocket()
-                socket.soTimeout = 1500
+                socket.soTimeout = 400  // Fast: 400ms timeout
                 socket.broadcast = true
                 
                 // Get broadcast address
