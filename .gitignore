@@ -1,38 +1,70 @@
-# Dependencies
+# ===================
+# WebCAMO .gitignore
+# ===================
+
+# ===== Dependencies =====
 node_modules/
 .gradle/
-build/
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# ===== Build outputs =====
+# Android
+android/app/build/
+android/.gradle/
+android/build/
+android/local.properties
 *.apk
 *.aar
-*.jar
+*.aab
 
-# IDE
+# Windows C++
+windows/build/
+windows/out/
+windows/bin/
+*.exe
+*.dll
+*.obj
+*.lib
+*.pdb
+*.exp
+*.ilk
+
+# Python
+windows-python/build/
+windows-python/dist/
+*.spec
+
+# ===== IDE =====
 .idea/
 *.iml
 .vscode/
 *.suo
 *.user
 *.sln.docstates
+.vs/
 
-# Build outputs
-android/app/build/
-android/.gradle/
-windows/build/
-windows/out/
-*.exe
-*.dll
-*.obj
-*.lib
-*.pdb
-
-# Local configuration
+# ===== Local configuration =====
 local.properties
 *.local
+.env
+.env.*
 
-# OS files
+# ===== OS files =====
 .DS_Store
 Thumbs.db
+Desktop.ini
+*.swp
+*~
 
-# Logs
+# ===== Logs =====
 *.log
 npm-debug.log*
+
+# ===== Keep clients folder but ignore contents =====
+# (APKs and EXEs are tracked in releases, not in git)
+clients/*
+!clients/.gitkeep
