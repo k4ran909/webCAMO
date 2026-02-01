@@ -21,7 +21,9 @@ import mmap
 # GUI imports
 import tkinter as tk
 from tkinter import ttk
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
+import pystray
+from pystray import MenuItem as item
 
 # Configuration
 DISCOVERY_PORT = 9001
@@ -75,6 +77,10 @@ class WebCAMOApp:
         self.shared_mem = None
         self.frame_event = None
         self.init_shared_memory()
+        
+        # System Tray
+        self.icon = None
+        self.setup_tray()
         
         # Build UI
         self.setup_ui()
@@ -139,6 +145,40 @@ class WebCAMOApp:
                 ctypes.windll.kernel32.SetEvent(self.frame_event)
         except Exception as e:
             pass  # Ignore errors to keep streaming
+        
+    def create_tray_icon(self):
+        """Create a default icon image"""
+        # Generate an icon with PIL
+        width = 64
+        height = 64
+        color1 = "#00ff88"
+        color2 = "#000000"
+        
+        image = Image.new('RGB', (width, height), color2)
+        dc = ImageDraw.Draw(image)
+        dc.ellipse((8, 8, 56, 56), fill=color1)
+        dc.text((20, 16), "W", fill=color2, font_size=40)
+        
+        return image
+        
+    def setup_tray(self):
+        """Setup system tray icon"""
+        def tray_thread():
+            image = self.create_tray_icon()
+            menu = (
+                item('Show WebCAMO', self.show_window, default=True),
+                item('Quit', self.quit_app)
+            )
+            
+            self.icon = pystray.Icon("webcamo", image, "WebCAMO", menu)
+            self.icon.run()
+            
+        thread = threading.Thread(target=tray_thread, daemon=True)
+        thread.start()
+        
+    def show_window(self, icon=None, item=None):
+        """Show the main window"""
+        self.root.after(0, self.root.deiconify)
         
     def setup_ui(self):
         """Create the main UI"""
@@ -430,9 +470,18 @@ class WebCAMOApp:
         self.root.after(0, update)
         
     def on_close(self):
-        """Handle window close"""
+        """Handle window close - minimize to tray"""
+        self.root.withdraw()
+        if self.icon:
+            self.icon.notify("WebCAMO is running in background", "WebCAMO")
+            
+    def quit_app(self, icon=None, item=None):
+        """Really quit the application"""
         self.running = False
         self.streaming = False
+        
+        if self.icon:
+            self.icon.stop()
         
         if self.client_socket:
             try:
@@ -447,6 +496,7 @@ class WebCAMOApp:
                 pass
                 
         self.root.destroy()
+        os._exit(0)  # Force exit threads
         
     def run(self):
         """Start the application"""
