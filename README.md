@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.jpg" alt="WebCAMO Logo" width="200" style="border-radius: 50%" />
+</p>
+
 # WebCAMO 📱➡️💻
 
 > **Transform your Android phone into a high-quality webcam for Windows**
