@@ -16,6 +16,7 @@ from queue import Queue, Empty
 import time
 import ctypes
 import os
+import mmap
 
 # GUI imports
 import tkinter as tk
@@ -29,6 +30,11 @@ BROADCAST_MESSAGE = b"WEBCAMO_DISCOVER"
 VIDEO_WIDTH = 1280
 VIDEO_HEIGHT = 720
 FPS = 30
+
+# Shared memory for DirectShow filter
+SHARED_MEM_NAME = "WebCAMO_SharedFrame"
+SHARED_MEM_SIZE = 16 + VIDEO_WIDTH * VIDEO_HEIGHT * 4  # Header + BGRA frame
+EVENT_NAME = "WebCAMO_FrameEvent"
 
 # Try to load virtual camera
 HAS_VIRTUAL_CAM = False
@@ -65,6 +71,11 @@ class WebCAMOApp:
         self.fps = 0
         self.last_fps_time = time.time()
         
+        # Shared memory for DirectShow filter
+        self.shared_mem = None
+        self.frame_event = None
+        self.init_shared_memory()
+        
         # Build UI
         self.setup_ui()
         
@@ -76,6 +87,58 @@ class WebCAMOApp:
         
         # Window close handler
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+    
+    def init_shared_memory(self):
+        """Initialize shared memory for DirectShow filter"""
+        if os.name != 'nt':
+            return
+            
+        try:
+            # Create shared memory
+            self.shared_mem = mmap.mmap(-1, SHARED_MEM_SIZE, tagname=SHARED_MEM_NAME)
+            
+            # Create event for signaling new frames
+            kernel32 = ctypes.windll.kernel32
+            self.frame_event = kernel32.CreateEventW(None, False, False, EVENT_NAME)
+            
+            # Initialize header (width, height, timestamp_low, timestamp_high)
+            self.shared_mem.seek(0)
+            self.shared_mem.write(struct.pack('<IIII', VIDEO_WIDTH, VIDEO_HEIGHT, 0, 0))
+            
+            print("DirectShow shared memory initialized")
+        except Exception as e:
+            print(f"Shared memory init failed: {e}")
+            self.shared_mem = None
+            self.frame_event = None
+    
+    def write_frame_to_shared_memory(self, frame):
+        """Write BGR frame to shared memory for DirectShow filter"""
+        if self.shared_mem is None:
+            return
+            
+        try:
+            # Ensure correct size
+            if frame.shape[1] != VIDEO_WIDTH or frame.shape[0] != VIDEO_HEIGHT:
+                frame = cv2.resize(frame, (VIDEO_WIDTH, VIDEO_HEIGHT))
+            
+            # Convert BGR to BGRA
+            bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+            
+            # Write header
+            timestamp = int(time.time() * 1000)
+            self.shared_mem.seek(0)
+            self.shared_mem.write(struct.pack('<IIII', 
+                VIDEO_WIDTH, VIDEO_HEIGHT,
+                timestamp & 0xFFFFFFFF, (timestamp >> 32) & 0xFFFFFFFF))
+            
+            # Write pixel data
+            self.shared_mem.write(bgra.tobytes())
+            
+            # Signal the DirectShow filter
+            if self.frame_event:
+                ctypes.windll.kernel32.SetEvent(self.frame_event)
+        except Exception as e:
+            pass  # Ignore errors to keep streaming
         
     def setup_ui(self):
         """Create the main UI"""
@@ -281,6 +344,9 @@ class WebCAMOApp:
                             self.virtual_cam.send(frame_resized)
                         except:
                             pass
+                    
+                    # Write to DirectShow shared memory
+                    self.write_frame_to_shared_memory(frame)
                             
         except Exception as e:
             print(f"Receive error: {e}")
