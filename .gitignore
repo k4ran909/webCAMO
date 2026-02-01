@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+.gradle/
+build/
+*.apk
+*.aar
+*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+
+# Build outputs
+android/app/build/
+android/.gradle/
+windows/build/
+windows/out/
+*.exe
+*.dll
+*.obj
+*.lib
+*.pdb
+
+# Local configuration
+local.properties
+*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
