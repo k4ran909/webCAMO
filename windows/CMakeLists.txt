@@ -21,6 +21,7 @@ set(SOURCES
     src/VirtualCamera.cpp
     src/FrameBuffer.cpp
     src/SystemTray.cpp
+    src/SimpleReceiver.cpp
 )
 
 set(HEADERS
@@ -30,6 +31,7 @@ set(HEADERS
     include/VirtualCamera.h
     include/FrameBuffer.h
     include/SystemTray.h
+    include/SimpleReceiver.h
     include/Common.h
 )
 
