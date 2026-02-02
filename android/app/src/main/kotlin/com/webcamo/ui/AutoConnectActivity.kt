@@ -2,13 +2,17 @@ package com.webcamo.ui
 
 import android.Manifest
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import android.util.Log
+import android.view.SurfaceHolder
 import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -19,14 +23,7 @@ import com.webcamo.service.CameraStreamService
 
 /**
  * AutoConnectActivity - Simple UI for controlling the background camera service
- * 
- * This Activity ONLY:
- * - Requests camera permission
- * - Starts the foreground service
- * - Displays status from the service
- * - Provides switch camera / stop buttons
- * 
- * ALL camera and streaming logic is in CameraStreamService for stable background operation.
+ * Now includes local preview binding
  */
 class AutoConnectActivity : AppCompatActivity() {
     companion object {
@@ -34,6 +31,22 @@ class AutoConnectActivity : AppCompatActivity() {
     }
     
     private lateinit var binding: ActivityAutoConnectBinding
+    private var cameraService: CameraStreamService? = null
+    private var isBound = false
+    
+    // Service Connection for Preview
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(className: ComponentName, service: IBinder) {
+            val binder = service as CameraStreamService.LocalBinder
+            cameraService = binder.getService()
+            isBound = true
+            tryAttemptPreview()
+        }
+        override fun onServiceDisconnected(arg0: ComponentName) {
+            isBound = false
+            cameraService = null
+        }
+    }
     
     // Broadcast receiver for service status updates
     private val statusReceiver = object : BroadcastReceiver() {
@@ -41,7 +54,6 @@ class AutoConnectActivity : AppCompatActivity() {
             val status = intent?.getStringExtra(CameraStreamService.EXTRA_STATUS) ?: return
             val fps = intent.getIntExtra(CameraStreamService.EXTRA_FPS, 0)
             val connected = intent.getBooleanExtra(CameraStreamService.EXTRA_CONNECTED, false)
-            
             updateUI(status, fps, connected)
         }
     }
@@ -65,6 +77,24 @@ class AutoConnectActivity : AppCompatActivity() {
         checkPermissionAndStart()
     }
     
+    override fun onStart() {
+        super.onStart()
+        // Bind to service for preview control
+        Intent(this, CameraStreamService::class.java).also { intent ->
+            bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        }
+    }
+    
+    override fun onStop() {
+        super.onStop()
+        if (isBound) {
+            // Detach preview before unbinding to avoid leaks
+            cameraService?.setPreviewSurface(null)
+            unbindService(connection)
+            isBound = false
+        }
+    }
+    
     override fun onResume() {
         super.onResume()
         // Register for status updates
@@ -83,28 +113,40 @@ class AutoConnectActivity : AppCompatActivity() {
             binding.statusText.text = "Ready"
             binding.statusText.setTextColor(getColor(android.R.color.darker_gray))
         }
+        tryAttemptPreview()
     }
     
     override fun onPause() {
         super.onPause()
-        try {
-            unregisterReceiver(statusReceiver)
-        } catch (e: Exception) {}
+        try { unregisterReceiver(statusReceiver) } catch (e: Exception) {}
     }
     
     private fun setupUI() {
-        // Switch camera button
         binding.switchCameraButton.setOnClickListener {
             val intent = Intent(this, CameraStreamService::class.java).apply {
                 action = CameraStreamService.ACTION_SWITCH_CAMERA
             }
             startService(intent)
-            Toast.makeText(this, "Camera switched", Toast.LENGTH_SHORT).show()
         }
         
-        // Initial state
         binding.statusText.text = "🔍 Starting..."
-        binding.statusText.setTextColor(getColor(android.R.color.white))
+        
+        // Setup SurfaceView
+        binding.previewView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                tryAttemptPreview()
+            }
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                cameraService?.setPreviewSurface(null)
+            }
+        })
+    }
+    
+    private fun tryAttemptPreview() {
+        if (isBound && cameraService != null && binding.previewView.holder.surface.isValid) {
+            cameraService?.setPreviewSurface(binding.previewView.holder.surface)
+        }
     }
     
     private fun checkPermissionAndStart() {
@@ -118,11 +160,9 @@ class AutoConnectActivity : AppCompatActivity() {
     
     private fun startStreamingService() {
         Log.d(TAG, "Starting streaming service")
-        
         val intent = Intent(this, CameraStreamService::class.java).apply {
             action = CameraStreamService.ACTION_START
         }
-        
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(intent)
@@ -131,7 +171,6 @@ class AutoConnectActivity : AppCompatActivity() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start service: ${e.message}")
-            Toast.makeText(this, "Failed to start camera service", Toast.LENGTH_LONG).show()
         }
     }
     
@@ -166,7 +205,6 @@ class AutoConnectActivity : AppCompatActivity() {
     }
     
     override fun onBackPressed() {
-        // Move app to background instead of stopping service
         moveTaskToBack(true)
     }
 }

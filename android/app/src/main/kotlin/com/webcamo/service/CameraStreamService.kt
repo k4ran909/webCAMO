@@ -11,7 +11,6 @@ import android.hardware.camera2.*
 import android.media.ImageReader
 import android.os.*
 import android.util.Log
-import android.util.Size
 import android.view.Surface
 import androidx.core.app.NotificationCompat
 import com.webcamo.R
@@ -24,18 +23,11 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Stable Foreground Service for background camera streaming
- * Works reliably on ALL Android versions (API 21+)
- * 
- * Key features:
- * - Proper foreground service with notification
- * - Full WakeLock to prevent CPU sleep  
- * - WiFi lock to maintain network
- * - Camera runs entirely in service (no activity conflict)
- * - Auto-reconnect on disconnect
- * - Stable across app minimize/restore
+ * Optimized for High FPS & Quality
  */
 class CameraStreamService : Service() {
     companion object {
@@ -44,7 +36,7 @@ class CameraStreamService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val DISCOVERY_PORT = 9001
         private const val STREAM_PORT = 9000
-        private const val JPEG_QUALITY = 85
+        private const val JPEG_QUALITY = 80 // Optimized for speed/quality balance
         private const val VIDEO_WIDTH = 1280
         private const val VIDEO_HEIGHT = 720
         
@@ -59,12 +51,23 @@ class CameraStreamService : Service() {
         
         @Volatile var isRunning = false
             private set
+            
+        // Singleton access for binding
+        var instance: CameraStreamService? = null
+            private set
     }
+    
+    // Binder
+    inner class LocalBinder : Binder() {
+        fun getService(): CameraStreamService = this@CameraStreamService
+    }
+    private val binder = LocalBinder()
     
     // Camera
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var imageReader: ImageReader? = null
+    private var previewSurface: Surface? = null
     private lateinit var cameraManager: CameraManager
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
@@ -77,8 +80,9 @@ class CameraStreamService : Service() {
     @Volatile private var isStreaming = false
     @Volatile private var isDiscovering = false
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val frameProcessingScope = CoroutineScope(Dispatchers.Default) // Dedicated for heavy image work
     
-    // Wake locks - CRITICAL for background operation
+    // Wake locks
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
     
@@ -86,13 +90,15 @@ class CameraStreamService : Service() {
     private var frameCount = 0
     private var lastFpsTime = System.currentTimeMillis()
     private var currentFps = 0
+    private val isProcessingFrame = AtomicBoolean(false) // Drop frames if busy
     
-    // Main thread handler for UI updates
+    // Main thread handler
     private val mainHandler = Handler(Looper.getMainLooper())
     
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Service onCreate")
+        instance = this
         cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
         createNotificationChannel()
     }
@@ -103,7 +109,6 @@ class CameraStreamService : Service() {
         when (intent?.action) {
             ACTION_START -> {
                 if (!isRunning) {
-                    // MUST call startForeground IMMEDIATELY (within 5 seconds on Android 8+)
                     startForegroundImmediately()
                     acquireLocks()
                     startCameraThread()
@@ -125,18 +130,33 @@ class CameraStreamService : Service() {
         return START_STICKY
     }
     
-    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onBind(intent: Intent?): IBinder {
+        return binder
+    }
     
     override fun onDestroy() {
         Log.d(TAG, "Service onDestroy")
+        instance = null
         stopEverything()
         super.onDestroy()
     }
     
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // App was swiped away - keep service running!
         Log.d(TAG, "Task removed, service continuing")
         super.onTaskRemoved(rootIntent)
+    }
+    
+    // ===== Public API for Activity =====
+    
+    fun setPreviewSurface(surface: Surface?) {
+        if (this.previewSurface != surface) {
+            Log.d(TAG, "Updating preview surface")
+            this.previewSurface = surface
+            // Restart session to apply new surface
+            if (cameraDevice != null) {
+                createCaptureSession()
+            }
+        }
     }
     
     // ===== Notification =====
@@ -144,129 +164,76 @@ class CameraStreamService : Service() {
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                CHANNEL_ID,
-                "WebCAMO Camera Stream",
-                NotificationManager.IMPORTANCE_LOW
+                CHANNEL_ID, "WebCAMO Streaming", NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Camera streaming to your PC"
+                description = "Camera streaming active"
                 setShowBadge(false)
-                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
     }
     
     private fun startForegroundImmediately() {
         val notification = buildNotification("🔍 Searching for PC...")
-        
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                // Android 14+
                 startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Android 10-13
                 startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
             } else {
-                // Android 9 and below
                 startForeground(NOTIFICATION_ID, notification)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "startForeground failed: ${e.message}")
-            // Fallback
             startForeground(NOTIFICATION_ID, notification)
         }
     }
     
     private fun buildNotification(text: String): Notification {
-        val notificationIntent = Intent(this, AutoConnectActivity::class.java).apply {
+        val intent = Intent(this, AutoConnectActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         val pendingIntent = PendingIntent.getActivity(
-            this, 0, notificationIntent,
+            this, 0, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        
-        val stopIntent = Intent(this, CameraStreamService::class.java).apply {
-            action = ACTION_STOP
-        }
-        val stopPendingIntent = PendingIntent.getService(
-            this, 1, stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+        val stopIntent = Intent(this, CameraStreamService::class.java).apply { action = ACTION_STOP }
+        val stopPending = PendingIntent.getService(this, 1, stopIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("WebCAMO")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentIntent(pendingIntent)
-            .addAction(android.R.drawable.ic_media_pause, "Stop", stopPendingIntent)
+            .addAction(android.R.drawable.ic_media_pause, "Stop", stopPending)
             .setOngoing(true)
-            .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
     }
     
     private fun updateNotification(text: String) {
         mainHandler.post {
             try {
-                val notification = buildNotification(text)
-                val manager = getSystemService(NotificationManager::class.java)
-                manager.notify(NOTIFICATION_ID, notification)
-            } catch (e: Exception) {
-                Log.e(TAG, "updateNotification failed: ${e.message}")
-            }
+                getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(text))
+            } catch (e: Exception) {}
         }
     }
     
     // ===== Locks =====
     
     private fun acquireLocks() {
-        // CPU wake lock - keeps processing running
         try {
-            val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "WebCAMO::CameraStream"
-            ).apply {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WebCAMO::WakeLock").apply {
                 setReferenceCounted(false)
-                acquire(24 * 60 * 60 * 1000L) // 24 hours max
+                acquire(24 * 60 * 60 * 1000L)
             }
-            Log.d(TAG, "WakeLock acquired")
-        } catch (e: Exception) {
-            Log.e(TAG, "WakeLock acquire failed: ${e.message}")
-        }
-        
-        // WiFi lock - keeps WiFi active for streaming
-        try {
-            val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
-            wifiLock = wifiManager.createWifiLock(
-                android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF,
-                "WebCAMO::WifiLock"
-            ).apply {
+            val wm = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
+            wifiLock = wm.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "WebCAMO::WifiLock").apply {
                 setReferenceCounted(false)
                 acquire()
             }
-            Log.d(TAG, "WifiLock acquired")
-        } catch (e: Exception) {
-            Log.e(TAG, "WifiLock acquire failed: ${e.message}")
-        }
-    }
-    
-    private fun releaseLocks() {
-        try {
-            wakeLock?.let { if (it.isHeld) it.release() }
-            wakeLock = null
         } catch (e: Exception) {}
-        
-        try {
-            wifiLock?.let { if (it.isHeld) it.release() }  
-            wifiLock = null
-        } catch (e: Exception) {}
-        
-        Log.d(TAG, "Locks released")
     }
     
     // ===== Discovery =====
@@ -274,16 +241,10 @@ class CameraStreamService : Service() {
     private fun startDiscoveryLoop() {
         if (isDiscovering) return
         isDiscovering = true
-        
-        scope.launch {
-            Log.d(TAG, "Discovery loop started")
+        scope.launch(Dispatchers.IO) {
             while (isActive && isRunning) {
                 if (!isStreaming) {
-                    try {
-                        discoverAndConnect()
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Discovery error: ${e.message}")
-                    }
+                    try { discoverAndConnect() } catch (e: Exception) {}
                 }
                 delay(500)
             }
@@ -292,80 +253,56 @@ class CameraStreamService : Service() {
     }
     
     private suspend fun discoverAndConnect() {
-        withContext(Dispatchers.IO) {
-            var udpSocket: DatagramSocket? = null
-            try {
-                udpSocket = DatagramSocket()
-                udpSocket.soTimeout = 400
-                udpSocket.broadcast = true
-                
-                val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
-                val dhcp = wifiManager.dhcpInfo
-                if (dhcp.ipAddress == 0) {
-                    Log.w(TAG, "No WiFi connection")
-                    return@withContext
+        var udpSocket: DatagramSocket? = null
+        try {
+            udpSocket = DatagramSocket()
+            udpSocket.soTimeout = 400
+            udpSocket.broadcast = true
+            
+            val wm = applicationContext.getSystemService(WIFI_SERVICE) as android.net.wifi.WifiManager
+            val dhcp = wm.dhcpInfo
+            if (dhcp.ipAddress == 0) return
+            
+            val broadcast = dhcp.ipAddress and dhcp.netmask or dhcp.netmask.inv()
+            val quads = ByteArray(4) { k -> (broadcast shr k * 8 and 0xFF).toByte() }
+            val address = InetAddress.getByAddress(quads)
+            
+            val message = "WEBCAMO_DISCOVER".toByteArray()
+            udpSocket.send(DatagramPacket(message, message.size, address, DISCOVERY_PORT))
+            
+            val buffer = ByteArray(1024)
+            val packet = DatagramPacket(buffer, buffer.size)
+            udpSocket.receive(packet)
+            
+            val response = String(packet.data, 0, packet.length)
+            if (response.startsWith("WEBCAMO_PC|")) {
+                val parts = response.split("|")
+                if (parts.size >= 3) {
+                    val port = parts[2].toIntOrNull() ?: STREAM_PORT
+                    val ip = packet.address.hostAddress ?: return
+                    connectToPC(ip, port)
                 }
-                
-                val broadcast = getBroadcastAddress(dhcp)
-                val message = "WEBCAMO_DISCOVER".toByteArray()
-                val packet = DatagramPacket(message, message.size, broadcast, DISCOVERY_PORT)
-                udpSocket.send(packet)
-                
-                val buffer = ByteArray(1024)
-                val responsePacket = DatagramPacket(buffer, buffer.size)
-                
-                udpSocket.receive(responsePacket)
-                val response = String(responsePacket.data, 0, responsePacket.length)
-                
-                if (response.startsWith("WEBCAMO_PC|")) {
-                    val parts = response.split("|")
-                    if (parts.size >= 3) {
-                        val port = parts[2].toIntOrNull() ?: STREAM_PORT
-                        val pcIp = responsePacket.address.hostAddress ?: return@withContext
-                        
-                        Log.d(TAG, "Found PC: $pcIp:$port")
-                        connectToPC(pcIp, port)
-                    }
-                }
-            } catch (e: SocketTimeoutException) {
-                // Normal - no PC found yet
-            } catch (e: Exception) {
-                Log.w(TAG, "Discovery: ${e.message}")
-            } finally {
-                udpSocket?.close()
             }
+        } catch (e: SocketTimeoutException) {
+            // No PC found
+        } finally {
+            udpSocket?.close()
         }
-    }
-    
-    private fun getBroadcastAddress(dhcp: android.net.DhcpInfo): InetAddress {
-        val broadcast = dhcp.ipAddress and dhcp.netmask or dhcp.netmask.inv()
-        val quads = ByteArray(4)
-        for (k in 0..3) {
-            quads[k] = (broadcast shr k * 8 and 0xFF).toByte()
-        }
-        return InetAddress.getByAddress(quads)
     }
     
     private suspend fun connectToPC(ip: String, port: Int) {
         if (isStreaming) return
-        
-        withContext(Dispatchers.IO) {
-            try {
-                Log.d(TAG, "Connecting to $ip:$port")
-                socket = Socket()
-                socket?.connect(InetSocketAddress(ip, port), 3000)
-                socket?.tcpNoDelay = true
-                outputStream = socket?.getOutputStream()
-                isStreaming = true
-                
-                updateNotification("📡 Streaming to $ip")
-                broadcastStatus("streaming", 0, true)
-                Log.d(TAG, "Connected!")
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "Connection failed: ${e.message}")
-                closeConnection()
-            }
+        try {
+            Log.d(TAG, "Connecting to $ip:$port")
+            socket = Socket()
+            socket?.connect(InetSocketAddress(ip, port), 3000)
+            socket?.tcpNoDelay = true
+            outputStream = socket?.getOutputStream()
+            isStreaming = true
+            updateNotification("📡 Streaming to $ip")
+            broadcastStatus("streaming", 0, true)
+        } catch (e: Exception) {
+            closeConnection()
         }
     }
     
@@ -382,107 +319,91 @@ class CameraStreamService : Service() {
     // ===== Camera =====
     
     private fun startCameraThread() {
-        cameraThread = HandlerThread("WebCAMOCamera").apply { 
-            start()
-        }
+        cameraThread = HandlerThread("WebCAMOCamera").apply { start() }
         cameraHandler = Handler(cameraThread!!.looper)
     }
     
     private fun openCamera() {
-        if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
-            Log.e(TAG, "Camera lock timeout")
-            return
-        }
-        
+        if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) return
         try {
-            val cameraId = selectCamera()
-            Log.d(TAG, "Opening camera: $cameraId")
-            
-            cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+            val id = selectCamera()
+            cameraManager.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
-                    Log.d(TAG, "Camera opened")
                     cameraDevice = camera
                     cameraOpenCloseLock.release()
                     createCaptureSession()
                 }
-                
                 override fun onDisconnected(camera: CameraDevice) {
-                    Log.w(TAG, "Camera disconnected")
                     cameraOpenCloseLock.release()
                     camera.close()
                     cameraDevice = null
-                    // Try to reopen
                     mainHandler.postDelayed({ openCamera() }, 1000)
                 }
-                
                 override fun onError(camera: CameraDevice, error: Int) {
-                    Log.e(TAG, "Camera error: $error")
                     cameraOpenCloseLock.release()
                     camera.close()
                     cameraDevice = null
-                    // Try to reopen
                     mainHandler.postDelayed({ openCamera() }, 2000)
                 }
             }, cameraHandler)
-            
-        } catch (e: SecurityException) {
-            Log.e(TAG, "Camera permission denied")
-            cameraOpenCloseLock.release()
-        } catch (e: CameraAccessException) {
-            Log.e(TAG, "Camera access: ${e.message}")
-            cameraOpenCloseLock.release()
         } catch (e: Exception) {
-            Log.e(TAG, "Camera open error: ${e.message}")
             cameraOpenCloseLock.release()
         }
     }
     
     private fun selectCamera(): String {
-        for (id in cameraManager.cameraIdList) {
-            val chars = cameraManager.getCameraCharacteristics(id)
-            val facing = chars.get(CameraCharacteristics.LENS_FACING)
-            if (useFrontCamera && facing == CameraCharacteristics.LENS_FACING_FRONT) return id
-            if (!useFrontCamera && facing == CameraCharacteristics.LENS_FACING_BACK) return id
-        }
-        return cameraManager.cameraIdList.firstOrNull() ?: "0"
+        return try {
+            cameraManager.cameraIdList.firstOrNull { id ->
+                val chars = cameraManager.getCameraCharacteristics(id)
+                val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                if (useFrontCamera) facing == CameraCharacteristics.LENS_FACING_FRONT
+                else facing == CameraCharacteristics.LENS_FACING_BACK
+            } ?: cameraManager.cameraIdList.firstOrNull() ?: "0"
+        } catch (e: Exception) { "0" }
     }
     
     private fun createCaptureSession() {
         val camera = cameraDevice ?: return
-        
         try {
-            imageReader = ImageReader.newInstance(
-                VIDEO_WIDTH, VIDEO_HEIGHT, 
-                ImageFormat.YUV_420_888, 3
-            )
+            // Close existing session
+            captureSession?.close()
+            captureSession = null
+            
+            imageReader?.close()
+            imageReader = ImageReader.newInstance(VIDEO_WIDTH, VIDEO_HEIGHT, ImageFormat.YUV_420_888, 2)
             
             imageReader?.setOnImageAvailableListener({ reader ->
-                val image = reader.acquireLatestImage()
-                if (image != null) {
-                    if (isStreaming) {
-                        processAndSendFrame(image)
+                if (!isStreaming) {
+                    // Drain queue if not streaming to avoid stalls
+                    reader.acquireLatestImage()?.close()
+                    return@setOnImageAvailableListener
+                }
+                
+                // Only process if previous frame is done
+                if (isProcessingFrame.compareAndSet(false, true)) {
+                    val image = reader.acquireLatestImage()
+                    if (image != null) {
+                        processFrameAsync(image)
+                    } else {
+                        isProcessingFrame.set(false)
                     }
-                    image.close()
+                } else {
+                    // Drop frame
+                    reader.acquireLatestImage()?.close()
                 }
             }, cameraHandler)
             
-            val surfaces = listOf(imageReader!!.surface)
+            val surfaces = ArrayList<Surface>()
+            surfaces.add(imageReader!!.surface)
+            previewSurface?.let { surfaces.add(it) } // Add preview surface if available
             
-            camera.createCaptureSession(
-                surfaces,
-                object : CameraCaptureSession.StateCallback() {
+            camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
-                        Log.d(TAG, "Capture session configured")
                         captureSession = session
                         startRepeatingCapture()
                     }
-                    
-                    override fun onConfigureFailed(session: CameraCaptureSession) {
-                        Log.e(TAG, "Capture session config failed")
-                    }
-                },
-                cameraHandler
-            )
+                    override fun onConfigureFailed(session: CameraCaptureSession) {}
+                }, cameraHandler)
         } catch (e: Exception) {
             Log.e(TAG, "Create session error: ${e.message}")
         }
@@ -491,29 +412,33 @@ class CameraStreamService : Service() {
     private fun startRepeatingCapture() {
         val camera = cameraDevice ?: return
         val session = captureSession ?: return
-        
         try {
             val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                 addTarget(imageReader!!.surface)
+                previewSurface?.let { addTarget(it) }
                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
                 set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                // Optimize FPS range
+                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(30, 30))
             }
-            
             session.setRepeatingRequest(builder.build(), null, cameraHandler)
-            Log.d(TAG, "Repeating capture started")
-        } catch (e: Exception) {
-            Log.e(TAG, "Start capture error: ${e.message}")
-        }
+        } catch (e: Exception) {}
     }
     
-    private fun processAndSendFrame(image: android.media.Image) {
-        try {
-            val jpegData = convertToJpeg(image)
-            sendJpegFrame(jpegData)
-            updateFps()
-        } catch (e: Exception) {
-            Log.e(TAG, "Frame error: ${e.message}")
+    private fun processFrameAsync(image: android.media.Image) {
+        // Run conversion on dedicated background thread
+        frameProcessingScope.launch {
+            try {
+                val jpeg = convertToJpeg(image)
+                image.close() // Close image as soon as data is copied/used
+                sendJpegFrame(jpeg)
+                updateFps()
+            } catch (e: Exception) {
+                try { image.close() } catch (e2: Exception) {}
+            } finally {
+                isProcessingFrame.set(false)
+            }
         }
     }
     
@@ -521,27 +446,22 @@ class CameraStreamService : Service() {
         val yBuffer = image.planes[0].buffer
         val uBuffer = image.planes[1].buffer  
         val vBuffer = image.planes[2].buffer
-        
         val ySize = yBuffer.remaining()
         val uSize = uBuffer.remaining()
         val vSize = vBuffer.remaining()
-        
         val nv21 = ByteArray(ySize + uSize + vSize)
         yBuffer.get(nv21, 0, ySize)
         vBuffer.get(nv21, ySize, vSize)
         uBuffer.get(nv21, ySize + vSize, uSize)
-        
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
         val out = ByteArrayOutputStream()
         yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), JPEG_QUALITY, out)
-        
         return out.toByteArray()
     }
     
     @Synchronized
     private fun sendJpegFrame(jpeg: ByteArray) {
         val stream = outputStream ?: return
-        
         try {
             val sizeBuffer = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
             sizeBuffer.putInt(jpeg.size)
@@ -549,7 +469,6 @@ class CameraStreamService : Service() {
             stream.write(jpeg)
             stream.flush()
         } catch (e: Exception) {
-            Log.w(TAG, "Send error: ${e.message}")
             closeConnection()
         }
     }
@@ -565,20 +484,26 @@ class CameraStreamService : Service() {
         }
     }
     
+    private fun stopEverything() {
+        isRunning = false; isStreaming = false; isDiscovering = false
+        scope.cancel()
+        frameProcessingScope.cancel()
+        closeConnection()
+        closeCamera()
+        cameraThread?.quitSafely()
+        cameraThread = null
+        try { wakeLock?.release() } catch (e: Exception) {}
+        try { wifiLock?.release() } catch (e: Exception) {}
+        broadcastStatus("stopped", 0, false)
+    }
+    
     private fun closeCamera() {
         try {
             cameraOpenCloseLock.acquire()
-            captureSession?.close()
-            captureSession = null
-            cameraDevice?.close()
-            cameraDevice = null
-            imageReader?.close()
-            imageReader = null
-        } catch (e: Exception) {
-            Log.e(TAG, "Close camera error: ${e.message}")
-        } finally {
-            cameraOpenCloseLock.release()
-        }
+            captureSession?.close(); captureSession = null
+            cameraDevice?.close(); cameraDevice = null
+            imageReader?.close(); imageReader = null
+        } finally { cameraOpenCloseLock.release() }
     }
     
     private fun restartCamera() {
@@ -586,33 +511,14 @@ class CameraStreamService : Service() {
         openCamera()
     }
     
-    private fun stopEverything() {
-        Log.d(TAG, "Stopping everything")
-        isRunning = false
-        isStreaming = false
-        isDiscovering = false
-        
-        scope.cancel()
-        closeConnection()
-        closeCamera()
-        
-        cameraThread?.quitSafely()
-        try { cameraThread?.join(1000) } catch (e: Exception) {}
-        cameraThread = null
-        cameraHandler = null
-        
-        releaseLocks()
-        broadcastStatus("stopped", 0, false)
-    }
-    
     private fun broadcastStatus(status: String, fps: Int, connected: Boolean) {
         try {
-            val intent = Intent(BROADCAST_STATUS).apply {
+            sendBroadcast(Intent(BROADCAST_STATUS).apply {
                 putExtra(EXTRA_STATUS, status)
                 putExtra(EXTRA_FPS, fps)
                 putExtra(EXTRA_CONNECTED, connected)
-            }
-            sendBroadcast(intent)
+            })
         } catch (e: Exception) {}
     }
 }
+
